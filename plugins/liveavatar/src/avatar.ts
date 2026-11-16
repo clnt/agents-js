@@ -91,7 +91,6 @@ export class AvatarSession extends voice.AvatarSession {
   private connOptions: APIConnectOptions;
 
   private api: LiveAvatarAPI;
-  private sessionId: string | null = null;
   private sessionToken: string | null = null;
   private wsUrl: string | null = null;
 
@@ -117,6 +116,7 @@ export class AvatarSession extends voice.AvatarSession {
   private forwardingSegment = false;
   private closing = false;
 
+  #sessionId: string | null = null;
   #logger = log();
 
   constructor(options: AvatarSessionOptions = {}) {
@@ -143,6 +143,11 @@ export class AvatarSession extends voice.AvatarSession {
 
   override get provider(): string {
     return 'liveavatar';
+  }
+
+  /** The LiveAvatar session ID after `start()` creates the session, otherwise `null`. */
+  get sessionId(): string | null {
+    return this.#sessionId;
   }
 
   /**
@@ -215,15 +220,15 @@ export class AvatarSession extends voice.AvatarSession {
       isSandbox: this.isSandbox,
       videoQuality: this.videoQuality,
     });
-    this.sessionId = sessionConfig.data.session_id;
+    this.#sessionId = sessionConfig.data.session_id;
     this.sessionToken = sessionConfig.data.session_token;
-    this.#logger.info({ sessionId: this.sessionId }, 'LiveAvatar session created');
+    this.#logger.info({ sessionId: this.#sessionId }, 'LiveAvatar session created');
 
-    if (!this.sessionId || !this.sessionToken) {
+    if (!this.#sessionId || !this.sessionToken) {
       throw new LiveAvatarException('LiveAvatar session creation returned no session id/token');
     }
 
-    const startData = await this.api.startStreamingSession(this.sessionId, this.sessionToken);
+    const startData = await this.api.startStreamingSession(this.#sessionId, this.sessionToken);
     this.wsUrl = startData.data.ws_url;
     this.#logger.info('LiveAvatar streaming session started');
 
@@ -575,11 +580,11 @@ export class AvatarSession extends voice.AvatarSession {
       closingResolver.resolve();
 
       try {
-        if (this.sessionId && this.sessionToken) {
-          const data = await this.api.stopStreamingSession(this.sessionId, this.sessionToken);
+        if (this.#sessionId && this.sessionToken) {
+          const data = await this.api.stopStreamingSession(this.#sessionId, this.sessionToken);
           // Mirrors python livekit-plugins-liveavatar/.../avatar.py - 304 line
           if (data.code <= 200) {
-            this.#logger.info({ sessionId: this.sessionId }, 'LiveAvatar session stopped');
+            this.#logger.info({ sessionId: this.#sessionId }, 'LiveAvatar session stopped');
           }
         }
       } catch (e) {
