@@ -7,9 +7,10 @@
 import { AgentSession as AgentSession_2 } from '@livekit/protocol';
 import { AudioFrame } from '@livekit/rtc-node';
 import { AudioResampler } from '@livekit/rtc-node';
-import type { Context } from '@opentelemetry/api';
+import { Context } from '@opentelemetry/api';
 import { EventEmitter } from 'events';
 import { EventEmitter as EventEmitter_2 } from 'node:events';
+import type { EventMap } from '@livekit/typed-emitter';
 import { FrameProcessor } from '@livekit/rtc-node';
 import { JsonObject } from '@bufbuild/protobuf';
 import type { JSONSchema7 } from 'json-schema';
@@ -24,7 +25,7 @@ import { RemoteParticipant } from '@livekit/rtc-node';
 import { RemoteTrackPublication } from '@livekit/rtc-node';
 import { Room } from '@livekit/rtc-node';
 import { RpcInvocationData } from '@livekit/rtc-node';
-import type { Span } from '@opentelemetry/api';
+import { Span } from '@opentelemetry/api';
 import type { TextStreamInfo } from '@livekit/rtc-node';
 import { Throws } from '@livekit/throws-transformer/throws';
 import { ThrowsPromise } from '@livekit/throws-transformer/throws';
@@ -58,6 +59,7 @@ export class AvatarSession extends voice.AvatarSession {
 export interface AvatarSessionOptions {
     apiKey?: string;
     apiUrl?: string;
+    audioLeadMs?: number;
     avatarId?: string;
     avatarParticipantIdentity?: string;
     avatarParticipantName?: string;
@@ -181,7 +183,7 @@ export type VideoQuality = 'very_high' | 'high' | 'medium' | 'low';
 
 // Warnings were encountered during analysis:
 //
-// src/avatar.ts:348:3 - (ae-unresolved-link) The @link reference could not be resolved: The package "@livekit/agents-plugin-liveavatar" does not have an export "SAMPLE_RATE"
+// src/avatar.ts:455:3 - (ae-unresolved-link) The @link reference could not be resolved: The package "@livekit/agents-plugin-liveavatar" does not have an export "SAMPLE_RATE"
 
 // (No @packageDocumentation comment for this package)
 

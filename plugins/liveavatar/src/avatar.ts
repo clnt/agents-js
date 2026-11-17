@@ -25,6 +25,10 @@ const FIRST_CHUNK_THRESHOLD_MS = 600;
 const SUBSEQUENT_CHUNK_THRESHOLD_MS = 1_000;
 const AVATAR_AGENT_IDENTITY = 'liveavatar-avatar-agent';
 const AVATAR_AGENT_NAME = 'liveavatar-avatar-agent';
+const DEFAULT_AUDIO_LEAD_MS = 2_000;
+const MAX_UNACKED_CHUNKS = 3;
+
+const now = (): number => performance.now();
 
 /**
  * Options for configuring an AvatarSession.
@@ -48,6 +52,14 @@ export interface AvatarSessionOptions {
   avatarParticipantName?: string;
   /** API retry/timeout options. */
   connOptions?: APIConnectOptions;
+  /**
+   * How far, in milliseconds, the audio sent to LiveAvatar may run ahead of playback.
+   * An interrupt waits behind at most this much queued audio. Keep the lead above the
+   * first two chunks (about 1.7 s) plus network jitter: below that, LiveAvatar runs out
+   * of audio after the first chunk, ends the turn mid-reply and can miss the interrupt.
+   * Defaults to 2000. A value that is not finite or not above 0 uses the default.
+   */
+  audioLeadMs?: number;
 }
 
 /**
@@ -89,6 +101,7 @@ export class AvatarSession extends voice.AvatarSession {
   private avatarParticipantIdentity: string;
   private avatarParticipantName: string;
   private connOptions: APIConnectOptions;
+  private audioLeadMs: number;
 
   private api: LiveAvatarAPI;
   private sessionToken: string | null = null;
@@ -116,6 +129,14 @@ export class AvatarSession extends voice.AvatarSession {
   private forwardingSegment = false;
   private closing = false;
 
+  private paceStartedAt: number | null = null;
+  private paceSentMs = 0;
+  private paceAckTimedOut = false;
+  private unackedChunks = 0;
+  private talkStartedAt: number | null = null;
+  private clearEpoch = 0;
+  private paceWake: Future<void> = new Future();
+
   #sessionId: string | null = null;
   #logger = log();
 
@@ -129,6 +150,9 @@ export class AvatarSession extends voice.AvatarSession {
     this.avatarParticipantIdentity = options.avatarParticipantIdentity || AVATAR_AGENT_IDENTITY;
     this.avatarParticipantName = options.avatarParticipantName || AVATAR_AGENT_NAME;
     this.connOptions = options.connOptions || DEFAULT_API_CONNECT_OPTIONS;
+    const audioLeadMs = options.audioLeadMs ?? DEFAULT_AUDIO_LEAD_MS;
+    this.audioLeadMs =
+      Number.isFinite(audioLeadMs) && audioLeadMs > 0 ? audioLeadMs : DEFAULT_AUDIO_LEAD_MS;
 
     this.api = new LiveAvatarAPI({
       apiKey: this.apiKey,
@@ -261,6 +285,7 @@ export class AvatarSession extends voice.AvatarSession {
    */
   async aclose(): Promise<void> {
     this.closing = true;
+    this.wakePacer();
     this.closeMsgChannel();
     if (this.audioBuffer) {
       await this.audioBuffer.aclose();
@@ -308,9 +333,9 @@ export class AvatarSession extends voice.AvatarSession {
    *    `playbackSegmentsCount` and `forwardAudio` consuming the frame. There
    *    `audioPlaying` is still false, and skipping the notify would leak the
    *    count and deadlock `waitForPlayout`.
-   * 2. `audioPlaying` covers the common barge-in: `forwardAudio` ships the
-   *    whole segment to LiveAvatar faster than real time, so `flush` clears
-   *    `wasCapturing` seconds before the avatar stops talking. Gating on
+   * 2. `audioPlaying` covers the common barge-in: `forwardAudio` runs up to
+   *    the audio lead ahead of playback, so `flush` clears `wasCapturing`
+   *    seconds before the avatar stops talking. Gating on
    *    `wasCapturing` alone would return early here and never send
    *    `agent.interrupt`, letting the avatar talk over the user.
    *
@@ -320,6 +345,11 @@ export class AvatarSession extends voice.AvatarSession {
    * but `forwardAudio` has not consumed it, so a residual chunk may still be
    * pending). Otherwise it would carry over and discard the first frame of
    * the *next* segment.
+   *
+   * The reported position is how long the avatar has talked, capped at the
+   * audio sent, because up to the lead of sent audio was never heard. The talk
+   * clock starts at LiveAvatar's `talking` event, which comes about 250 ms
+   * before the guest hears audio, so the position can run that far ahead.
    */
   private onClearBuffer(ev: voice.QueueAudioOutputClearEvent): void {
     const wasPlaying = this.audioPlaying;
@@ -331,12 +361,89 @@ export class AvatarSession extends voice.AvatarSession {
       this.chunkInterrupted = true;
     }
     if (this.audioBuffer) {
-      this.audioBuffer.notifyPlaybackFinished(this.playbackPosition, true);
+      const heardPosition =
+        this.talkStartedAt === null
+          ? 0
+          : Math.min((now() - this.talkStartedAt) / 1000, this.playbackPosition);
+      this.audioBuffer.notifyPlaybackFinished(heardPosition, true);
       if (this.avatarSpeaking) {
         this.sendEvent({ type: 'agent.interrupt', event_id: shortuuid() });
       }
       this.playbackPosition = 0;
     }
+    this.talkStartedAt = null;
+    this.clearEpoch++;
+    this.unackedChunks = 0;
+    this.wakePacer();
+  }
+
+  /**
+   * Wait until the next `agent.speak` chunk may go to LiveAvatar. The first chunk of a
+   * segment goes at once. A later chunk waits until the audio sent stays within the lead
+   * of the playback clock, then while `MAX_UNACKED_CHUNKS` chunks are unacknowledged,
+   * for at most about the lead. Once that ack wait times out, the rest of the segment
+   * waits for the clock alone. Resolves `false` when an interrupt or close lands first.
+   */
+  private async waitToSend(chunkMs: number): Promise<boolean> {
+    const epoch = this.clearEpoch;
+    const aborted = () => this.closing || this.clearEpoch !== epoch;
+    if (aborted()) return false;
+    if (this.paceStartedAt === null) return true;
+
+    const paceStartedAt = this.paceStartedAt;
+    while (true) {
+      const clockWaitMs = this.paceSentMs + chunkMs - this.audioLeadMs - (now() - paceStartedAt);
+      if (clockWaitMs <= 0) break;
+      await this.sleepUntilWoken(clockWaitMs);
+      if (aborted()) return false;
+    }
+
+    const ackDeadline = now() + this.audioLeadMs;
+    while (!this.paceAckTimedOut && this.ackCapReached()) {
+      const ackWaitMs = ackDeadline - now();
+      if (ackWaitMs <= 0) {
+        this.paceAckTimedOut = true;
+        this.#logger.warn(
+          { unackedChunks: this.unackedChunks, waitedMs: this.audioLeadMs },
+          'LiveAvatar did not acknowledge the audio in time, sending anyway',
+        );
+        break;
+      }
+      await this.sleepUntilWoken(ackWaitMs);
+      if (aborted()) return false;
+    }
+    return true;
+  }
+
+  private ackCapReached(): boolean {
+    return this.unackedChunks >= MAX_UNACKED_CHUNKS;
+  }
+
+  private async sleepUntilWoken(ms: number): Promise<void> {
+    this.paceWake = new Future();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        this.paceWake.await,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, ms);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private wakePacer(): void {
+    if (!this.paceWake.done) {
+      this.paceWake.resolve();
+    }
+  }
+
+  private resetPaceClock(): void {
+    this.paceStartedAt = null;
+    this.paceSentMs = 0;
+    this.paceAckTimedOut = false;
   }
 
   /**
@@ -409,6 +516,9 @@ export class AvatarSession extends voice.AvatarSession {
           }
           const encoded = Buffer.from(merged).toString('base64');
           this.sendEvent({ type: 'agent.speak', event_id: shortuuid(), audio: encoded });
+          this.paceStartedAt ??= now();
+          this.paceSentMs += chunkDurationMs;
+          this.unackedChunks++;
           this.playbackPosition += chunkDurationMs / 1000;
           chunkBuf = [];
           chunkDurationMs = 0;
@@ -421,6 +531,19 @@ export class AvatarSession extends voice.AvatarSession {
           isFirstChunk = true;
         };
 
+        // The recheck runs in the same continuation as the flush, so an
+        // interrupt that lands while the caller resumes cannot slip a chunk out.
+        const sendWhenPaced = async (): Promise<boolean> => {
+          const epoch = this.clearEpoch;
+          const allowed = await this.waitToSend(chunkDurationMs);
+          if (!allowed || this.closing || this.clearEpoch !== epoch) {
+            discardChunk();
+            return false;
+          }
+          flushChunk();
+          return true;
+        };
+
         const reader = this.audioBuffer.stream().getReader();
         try {
           while (true) {
@@ -429,6 +552,7 @@ export class AvatarSession extends voice.AvatarSession {
             if (this.chunkInterrupted) {
               this.chunkInterrupted = false;
               discardChunk();
+              this.resetPaceClock();
               interruptDraining = true;
             }
 
@@ -437,10 +561,13 @@ export class AvatarSession extends voice.AvatarSession {
               // operation for the next segment.
               interruptDraining = false;
               this.forwardingSegment = false;
-              flushChunk();
+              if (chunkBuf.length > 0) {
+                await sendWhenPaced();
+              }
               this.sendEvent({ type: 'agent.speak_end', event_id: shortuuid() });
               this.sendEvent({ type: 'agent.start_listening', event_id: shortuuid() });
               isFirstChunk = true;
+              this.resetPaceClock();
               continue;
             }
 
@@ -463,7 +590,9 @@ export class AvatarSession extends voice.AvatarSession {
                 ? FIRST_CHUNK_THRESHOLD_MS
                 : SUBSEQUENT_CHUNK_THRESHOLD_MS;
               if (chunkDurationMs >= thresholdMs) {
-                flushChunk();
+                if (!(await sendWhenPaced())) {
+                  break;
+                }
               }
             }
           }
@@ -577,6 +706,7 @@ export class AvatarSession extends voice.AvatarSession {
       this.#logger.warn({ error: String(e) }, 'LiveAvatar main task error');
     } finally {
       this.closing = true;
+      this.wakePacer();
       closingResolver.resolve();
 
       try {
@@ -634,10 +764,14 @@ export class AvatarSession extends voice.AvatarSession {
         this.handleAgentStateUpdated(event);
         break;
       case 'agent.audio_buffer_cleared':
+        this.unackedChunks = 0;
+        this.wakePacer();
         this.handleAgentSpeakInterrupted();
         break;
       case 'agent.audio_buffer_appended':
         // One ack per speak chunk, too frequent to log.
+        this.unackedChunks = Math.max(0, this.unackedChunks - 1);
+        this.wakePacer();
         break;
       case 'agent.audio_buffer_committed':
         // Command acknowledgement; playback follows speak_* / agent.state_updated.
@@ -679,6 +813,7 @@ export class AvatarSession extends voice.AvatarSession {
       return;
     }
     this.avatarSpeaking = false;
+    this.talkStartedAt = null;
     if (!this.avatarInterrupted && this.audioBuffer) {
       this.audioBuffer.notifyPlaybackFinished(this.playbackPosition, false);
       this.playbackPosition = 0;
@@ -696,6 +831,7 @@ export class AvatarSession extends voice.AvatarSession {
       // only a new turn clears the latch; a redundant start would otherwise let
       // a second notifyPlaybackFinished through
       this.avatarInterrupted = false;
+      this.talkStartedAt = now();
       this.audioBuffer?.notifyPlaybackStarted();
     }
   }

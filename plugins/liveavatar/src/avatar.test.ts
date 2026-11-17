@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 LiveKit, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AvatarSession } from './avatar.js';
 
 const logger = vi.hoisted(() => ({
@@ -49,6 +49,10 @@ function createAvatar(): [AvatarSession, AvatarSessionInternals, FakeAudioBuffer
 describe('LiveAvatar WebSocket event dispatch', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('still unblocks forwarding when the session connects', () => {
@@ -189,12 +193,14 @@ describe('LiveAvatar WebSocket event dispatch', () => {
   });
 
   it('sends an interrupt on barge-in after the segment was flushed', () => {
+    vi.useFakeTimers({ toFake: ['performance'] });
     const [session, avatar, buffer] = createAvatar();
     avatar.handleServerEvent({
       type: 'agent.state_updated',
       previous_state: 'idle',
       new_state: 'talking',
     });
+    vi.advanceTimersByTime(3500);
     // forwardAudio outruns real time, so flush() clears wasCapturing while the
     // avatar is still rendering the segment; audioPlaying is what remains true.
     avatar.audioPlaying = true;
@@ -211,7 +217,14 @@ describe('LiveAvatar WebSocket event dispatch', () => {
   });
 
   it('drops the residual chunk on a barge-in after flush before the segment end is consumed', () => {
+    vi.useFakeTimers({ toFake: ['performance'] });
     const [, avatar, buffer] = createAvatar();
+    avatar.handleServerEvent({
+      type: 'agent.state_updated',
+      previous_state: 'idle',
+      new_state: 'talking',
+    });
+    vi.advanceTimersByTime(600);
     // flush() already queued the AudioSegmentEnd (wasCapturing is false), but
     // forwardAudio is still mid-segment holding a partial chunk.
     avatar.audioPlaying = true;

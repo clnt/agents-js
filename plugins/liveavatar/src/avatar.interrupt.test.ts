@@ -185,15 +185,18 @@ describe('LiveAvatar interrupt through the audio queue', () => {
     avatar = undefined;
     sockets.length = 0;
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   it('interrupts the avatar when the reply is cut off after all its audio was forwarded', async () => {
+    vi.useFakeTimers({ toFake: ['performance'] });
     const started = await startAvatar();
     avatar = started.avatar;
     const { audio, socket } = started;
 
     await forwardReply(audio, socket, 14, 1);
     await receive(socket, { type: 'agent.state_updated', new_state: 'talking' });
+    vi.advanceTimersByTime(1400);
     audio.clearBuffer();
 
     const playout = await withTimeout(audio.waitForPlayout());
@@ -220,6 +223,7 @@ describe('LiveAvatar interrupt through the audio queue', () => {
   });
 
   it('drops the unsent remainder when the interrupt lands before the segment end is read', async () => {
+    vi.useFakeTimers({ toFake: ['performance'] });
     const started = await startAvatar();
     avatar = started.avatar;
     const { audio, socket } = started;
@@ -228,6 +232,7 @@ describe('LiveAvatar interrupt through the audio queue', () => {
     await vi.waitFor(() => expect(count(socket, 'agent.speak')).toBe(1));
     await nextTick();
     await receive(socket, { type: 'agent.state_updated', new_state: 'talking' });
+    vi.advanceTimersByTime(600);
     audio.flush();
     audio.clearBuffer();
 
